@@ -35,6 +35,8 @@ import android.os.SystemClock;
 import android.telephony.AccessNetworkConstants;
 import android.telephony.Annotation;
 import android.telephony.CarrierConfigManager;
+import android.telephony.CellIdentity;
+import android.telephony.CellIdentityNr;
 import android.telephony.CellInfo;
 import android.telephony.NetworkRegistrationInfo;
 import android.telephony.PhysicalChannelConfig;
@@ -247,6 +249,11 @@ public class NetworkTypeController extends StateMachine {
 
     // Ratchet physical channel config fields to prevent 5G/5G+ flickering
     @NonNull private Set<Integer> mRatchetedNrBands = new HashSet<>();
+    /**
+     * True when an NR PhysicalChannelConfig is present but its band is unspecified (0).
+     * Common on NSA/ENDC where OEM modems omit the NR secondary band.
+     */
+    private boolean mNrPhysicalChannelBandUnknown = false;
     // TODO(b/316425811 remove the workaround)
     private boolean mLastShownNrDueToAdvancedBand = false;
     private List<Integer> mRatchetedNrBandwidths = new ArrayList<>();
@@ -1441,6 +1448,7 @@ public class NetworkTypeController extends StateMachine {
         int anchorLteCellId = PhysicalChannelConfig.PHYSICAL_CELL_ID_UNKNOWN;
         List<Integer> nrBandwidths = new ArrayList<>();
         Set<Integer> nrBands = new HashSet<>();
+        boolean nrBandUnknown = false;
         if (physicalChannelConfigs != null) {
             for (PhysicalChannelConfig config : physicalChannelConfigs) {
                 if (config.getNetworkType() == TelephonyManager.NETWORK_TYPE_NR) {
@@ -1449,7 +1457,14 @@ public class NetworkTypeController extends StateMachine {
                         anchorNrCellId = config.getPhysicalCellId();
                     }
                     nrBandwidths.add(config.getCellBandwidthDownlinkKhz());
-                    nrBands.add(config.getBand());
+                    // Band 0 means unspecified on some OEM modems; ignore it so we can
+                    // fall back to CellIdentityNr bands for NR Advanced detection.
+                    int nrBand = config.getBand();
+                    if (nrBand > 0) {
+                        nrBands.add(nrBand);
+                    } else {
+                        nrBandUnknown = true;
+                    }
                 } else if (config.getNetworkType() == TelephonyManager.NETWORK_TYPE_LTE) {
                     if (config.getConnectionStatus() == CellInfo.CONNECTION_PRIMARY_SERVING
                             && anchorLteCellId == PhysicalChannelConfig.PHYSICAL_CELL_ID_UNKNOWN) {
@@ -1507,6 +1522,11 @@ public class NetworkTypeController extends StateMachine {
         mLastAnchorNrCellId = anchorNrCellId;
         mPhysicalChannelConfigs = physicalChannelConfigs;
         mDoesPccListIndicateIdle = false;
+        // Only remember unknown-band NR when we actually saw an NR PCC entry this update.
+        // If PCC is empty/idle, keep prior flag so ratchet/grace logic can still use it.
+        if (!isPccListEmpty) {
+            mNrPhysicalChannelBandUnknown = nrBandUnknown && nrBands.isEmpty();
+        }
         if (DBG) {
             log("Physical channel configs updated: anchorNrCell=" + mLastAnchorNrCellId
                     + ", nrBandwidths=" + mRatchetedNrBandwidths + ", nrBands=" +  mRatchetedNrBands
@@ -1834,7 +1854,63 @@ public class NetworkTypeController extends StateMachine {
      * @return {@code true} if the device is in NR advanced mode (i.e. 5G+).
      */
     private boolean isNrAdvanced() {
-        return isNrAdvancedForPccFields(mRatchetedNrBandwidths, mRatchetedNrBands);
+        if (isNrAdvancedForPccFields(mRatchetedNrBandwidths, mRatchetedNrBands)) {
+            return true;
+        }
+        // Fallback: PhysicalChannelConfig often reports band=0 on OEM SA stacks while
+        // CellIdentityNr already has the real band (e.g. n41 for T-Mobile 5G UC).
+        Set<Integer> cellIdentityBands = getNrBandsFromCellIdentity();
+        if (!cellIdentityBands.isEmpty()) {
+            if (DBG) {
+                log("isNrAdvanced: PCC bands=" + mRatchetedNrBands
+                        + " missed; trying CellIdentity bands=" + cellIdentityBands);
+            }
+            return isNrAdvancedForPccFields(mRatchetedNrBandwidths, cellIdentityBands);
+        }
+        // NSA/ENDC fallback: some OEM modems report an NR secondary with band=0 and no
+        // CellIdentityNr (primary is LTE). When the carrier designates advanced bands,
+        // treat connected NR with an unspecified band as advanced so UW/UC can show.
+        if (mNrPhysicalChannelBandUnknown
+                && !mAdditionalNrAdvancedBands.isEmpty()
+                && (isNrConnected() || mServiceState.getDataNetworkType()
+                        == TelephonyManager.NETWORK_TYPE_NR)) {
+            if (DBG) {
+                log("isNrAdvanced: NR PCC band unknown; assuming carrier advanced bands="
+                        + mAdditionalNrAdvancedBands);
+            }
+            return isNrAdvancedForPccFields(
+                    mRatchetedNrBandwidths, mAdditionalNrAdvancedBands);
+        }
+        return false;
+    }
+
+    /**
+     * NR bands from the current PS WWAN CellIdentity, ignoring unspecified (0) values.
+     */
+    @NonNull
+    private Set<Integer> getNrBandsFromCellIdentity() {
+        Set<Integer> bands = new HashSet<>();
+        if (mServiceState == null) {
+            return bands;
+        }
+        NetworkRegistrationInfo nri = mServiceState.getNetworkRegistrationInfo(
+                NetworkRegistrationInfo.DOMAIN_PS,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        if (nri == null) {
+            return bands;
+        }
+        CellIdentity cellIdentity = nri.getCellIdentity();
+        if (cellIdentity instanceof CellIdentityNr) {
+            int[] nrBands = ((CellIdentityNr) cellIdentity).getBands();
+            if (nrBands != null) {
+                for (int band : nrBands) {
+                    if (band > 0) {
+                        bands.add(band);
+                    }
+                }
+            }
+        }
+        return bands;
     }
 
     private boolean isNrAdvancedForPccFields(List<Integer> bandwidths, Set<Integer> bands) {
@@ -1970,6 +2046,7 @@ public class NetworkTypeController extends StateMachine {
         pw.println("mRatchetedNrBandwidths=" + mRatchetedNrBandwidths);
         pw.println("mAdditionalNrAdvancedBandsList=" + mAdditionalNrAdvancedBands);
         pw.println("mRatchetedNrBands=" + mRatchetedNrBands);
+        pw.println("mNrPhysicalChannelBandUnknown=" + mNrPhysicalChannelBandUnknown);
         pw.println("mLastAnchorNrCellId=" + mLastAnchorNrCellId);
         pw.println("mDoesPccListIndicateIdle=" + mDoesPccListIndicateIdle);
         pw.println("mPrimaryTimerState=" + mPrimaryTimerState);
